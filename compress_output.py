@@ -1,135 +1,361 @@
 #!/usr/bin/env python3
 """
-Claude Code PreToolUse hook — trims verbose CLI output before it reaches Claude.
+Laravel Claude Code Token Compressor — hooks for Claude Code's Bash tool.
 
-Drop this in your project: .claude/hooks/compress_output.py
-Make it executable: chmod +x .claude/hooks/compress_output.py
+PreToolUse:  adds --compact to `php artisan test` / `vendor/bin/pest`, so test
+             runs only print failures. The rewritten command still goes through
+             Claude Code's permission checks and sandbox like any other.
+PostToolUse: after a command succeeds, rewrites what Claude *sees*: noise is
+             stripped (progress bars, passing tests, install chatter, dot
+             leaders) while errors, warnings and summaries are kept. Anything
+             still too long is cut to head + tail with important middle lines
+             kept, and the untouched output is saved to a file Claude can read.
 
-How it works:
-  Claude Code fires a PreToolUse event before every Bash command.
-  When a verbose command is detected (ls, find, route:list, etc.), this hook:
-    1. Runs the command itself with truncation
-    2. Sends the trimmed output back to Claude via stderr
-    3. Exits with code 2, which blocks the original command from running
+Commands only ever run once, and only via Claude Code itself. Claude Code does
+not let hooks replace the output of failed commands, which is why tests are
+handled up front by the PreToolUse rewrite.
 
-  Claude receives the truncated output as context and continues normally.
-  The original full command never runs, so Claude never burns tokens on it.
+The hook fails open: on any error it exits 0 with no output and Claude gets
+the original result unchanged.
 
-  Note: updatedInput JSON approach is currently bugged in Claude Code — this
-  exit-2 method is the reliable workaround.
+Usage:
+  As a hook:  configured in .claude/settings.json (reads hook JSON on stdin)
+  Stats:      python3 .claude/hooks/compress_output.py --stats
 """
 
 import json
-import sys
+import os
 import re
-import subprocess
+import sys
+import time
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Config — tweak these line limits to taste
+# Config
 # ---------------------------------------------------------------------------
 
-RULES = [
-    # (regex to match command, max lines to keep, label for log)
-    (r'\bls\b',                          40,  "directory listing"),
-    (r'\bfind\b',                        30,  "find results"),
-    (r'\bgit log\b',                     20,  "git log"),
-    (r'\bgit diff\b',                   100,  "git diff"),
-    (r'\bgit status\b',                  30,  "git status"),
-    (r'\bphp artisan route:list\b',      60,  "route list"),
-    (r'\bphp artisan\b',                 50,  "artisan output"),
-    (r'\bcomposer\b',                    40,  "composer output"),
-    (r'\bnpm\b|\byarn\b',                40,  "npm/yarn output"),
-    (r'\bcat\b.*\.(log|txt|json)\b',     80,  "large file cat"),
-    (r'\bgrep\b',                        50,  "grep results"),
+# Output shorter than this is passed through untouched.
+MIN_CHARS = 1000
+
+# After filtering, anything longer than this is cut to head + tail.
+# Above ~30,000 chars Claude Code already saves output to a file and shows
+# Claude a 2KB preview, so this hook steps aside; this budget covers the range
+# below that, which Claude Code would otherwise put into context in full.
+MAX_CHARS = 8000
+
+# Only rewrite the output if we save at least this fraction of it.
+MIN_SAVING = 0.15
+
+# Lines in the dropped middle of a long output that are always kept.
+IMPORTANT = re.compile(
+    r"\b(error|exception|fatal|fail(ed|ure|ing)?|warn(ing)?|denied|"
+    r"not found|undefined|cannot|unable|traceback|panic)\b|✗|⨯|✘",
+    re.I,
+)
+
+# Put "# nocompress" in a command (or set TOKEN_COMPRESSOR=off) to skip it.
+OPT_OUT = re.compile(r"#\s*nocompress\b")
+
+DATA_DIR = Path(os.environ.get("TOKEN_COMPRESSOR_DIR", Path.home() / ".claude" / "token-compressor"))
+RAW_DIR = DATA_DIR / "raw"
+STATS_FILE = DATA_DIR / "stats.jsonl"
+RAW_KEEP_SECONDS = 2 * 24 * 3600
+
+# Test commands that get --compact appended. Only plain commands are rewritten
+# (an optional leading `cd dir &&` is fine): anything with pipes, redirects,
+# command lists or substitutions is left alone, since appending would change
+# what it means.
+COMPACT_TEST = re.compile(r"^(cd [^\s;&|]+ && )?(php artisan test|(\./)?vendor/bin/pest|pest)(\s[^|;&<>`$#\n]*)?$")
+
+# ---------------------------------------------------------------------------
+# Generic cleanup — applied to everything. Only removes rendering artifacts,
+# so file contents shown with `cat` etc. are never altered.
+# ---------------------------------------------------------------------------
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>]")
+
+
+def clean(text):
+    text = ANSI.sub("", text)
+    lines = []
+    for line in text.split("\n"):
+        # A carriage return redraws the line (progress bars): keep the final state.
+        if "\r" in line:
+            line = line.rstrip("\r").split("\r")[-1]
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Command-specific filters. Each takes a list of lines and returns a new list.
+# ---------------------------------------------------------------------------
+
+def collapse_repeats(lines):
+    """Replace runs of 3+ identical lines with one copy and a count."""
+    out, i = [], 0
+    while i < len(lines):
+        j = i
+        while j + 1 < len(lines) and lines[j + 1] == lines[i]:
+            j += 1
+        out.append(lines[i])
+        if j - i >= 2:
+            out.append(f"  [… previous line repeated {j - i} more times]")
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def squeeze_blanks(lines):
+    out = []
+    for line in lines:
+        if line.strip() or (out and out[-1].strip()):
+            out.append(line)
+    return out
+
+
+def drop(lines, pattern, label):
+    """Remove lines matching pattern, leaving a one-line note of how many."""
+    kept = [l for l in lines if not pattern.search(l)]
+    n = len(lines) - len(kept)
+    if n:
+        kept.append(f"[compressor: {n} {label} lines removed]")
+    return kept
+
+
+# Pest / PHPUnit / artisan test / Jest / Vitest
+TEST_PASS = re.compile(
+    r"^\s*(✓|✔|√|PASS\b|\[PASS\]|ok \d)"          # passing test lines
+    r"|^\s*[.SIRW]{3,}\s*(\d+\s*/\s*\d+\s*\(\s*\d+%\))?\s*$"  # PHPUnit progress dots
+)
+
+
+def filter_tests(lines):
+    return squeeze_blanks(drop(lines, TEST_PASS, "passing-test"))
+
+
+# composer / npm / yarn / pnpm / bun install-type commands
+INSTALL_NOISE = re.compile(
+    r"^\s*-\s+(Installing|Downloading|Upgrading|Downgrading|Updating|Removing|Locking|Syncing)\b"
+    r"|^\s*\d+/\d+\s*\[[=>\-. ]*\]"                # composer progress
+    r"|^\s*(npm (WARN|warn) deprecated|warning .* deprecated)"
+    r"|^\s*(Progress|Resolving|Fetching|Linking|Building fresh packages)"
+    r"|^\s*[@\w./-]+ (suggests|is suggesting)\b"
+    r"|^\s*\d+ packages? you are using (is|are) looking for funding"
+    r"|^\s*(Run `npm fund`|  run `npm fund`)"
+)
+
+
+def filter_install(lines):
+    return squeeze_blanks(collapse_repeats(drop(lines, INSTALL_NOISE, "install-progress")))
+
+
+# Vite / webpack / mix build output: one line per emitted asset.
+BUILD_ASSET = re.compile(r"^\s*\S+\.(js|css|map|json|svg|png|jpe?g|woff2?|ttf|ico|webp)\s+[\d.,]+\s*(kB|KiB|B|MB|bytes)\b", re.I)
+BUILD_NOISE = re.compile(r"^\s*(transforming|rendering chunks|computing gzip size)", re.I)
+
+
+def filter_build(lines):
+    lines = drop(lines, BUILD_ASSET, "built-asset")
+    return squeeze_blanks(drop(lines, BUILD_NOISE, "build-progress"))
+
+
+# `php artisan route:list`, `about`, `schedule:list` etc. pad columns with dots.
+DOT_LEADER = re.compile(r"\s*\.{4,}\s*")
+
+
+def filter_artisan(lines):
+    return squeeze_blanks([DOT_LEADER.sub(" … ", l) for l in lines])
+
+
+# Order matters: first match wins. (regex on the command, filter, label)
+FILTERS = [
+    (r"\b(artisan test|pest|phpunit|paratest|jest|vitest)\b|\b(npm|yarn|pnpm|bun) (run )?test\b", filter_tests, "tests"),
+    (r"\bcomposer (install|update|require|remove|upgrade|i|u)\b|\b(npm|yarn|pnpm|bun) (install|ci|add|i|update|upgrade|remove)\b|^\s*(yarn|pnpm|bun)\s*$", filter_install, "install"),
+    (r"\b(vite|webpack|mix)\b.*\bbuild\b|\bvite build\b|\b(npm|yarn|pnpm|bun) (run )?(build|prod|production|dev)\b", filter_build, "build"),
+    (r"\bartisan\b", filter_artisan, "artisan"),
 ]
 
-# Commands that should never be truncated (they're short by nature or interactive)
-SKIP_PATTERNS = [
-    r'\bphp artisan make:',    # scaffolding — output is short and important
-    r'\bphp artisan migrate',  # migration output is short and important
-    r'\bphp artisan tinker',   # interactive
-    r'\bgit (add|commit|push|pull|checkout|branch)\b',  # git write commands
-    r'\bchmod\b|\bchown\b',
-]
+# ---------------------------------------------------------------------------
+# Budget: keep head + tail, plus important lines from the middle.
+# ---------------------------------------------------------------------------
+
+def fit(text, budget, raw_path):
+    if len(text) <= budget:
+        return text
+    lines = text.split("\n")
+    head_budget, tail_budget = int(budget * 0.3), int(budget * 0.5)
+    mid_budget = budget - head_budget - tail_budget
+
+    head, used = [], 0
+    for line in lines:
+        if used + len(line) > head_budget:
+            break
+        head.append(line)
+        used += len(line) + 1
+
+    tail, used = [], 0
+    for line in reversed(lines[len(head):]):
+        if used + len(line) > tail_budget:
+            break
+        tail.insert(0, line)
+        used += len(line) + 1
+
+    middle = lines[len(head):len(lines) - len(tail)]
+    important, used = [], 0
+    for line in middle:
+        if IMPORTANT.search(line) and used + len(line) <= mid_budget:
+            important.append(line)
+            used += len(line) + 1
+
+    where = f" Full output: {raw_path}" if raw_path else ""
+    note = f"[compressor: {len(middle)} lines omitted here"
+    note += f", {len(important)} error/warning lines kept below]" if important else "]"
+    return "\n".join(head + [note + where] + important + (["[…]"] if important else []) + tail)
+
 
 # ---------------------------------------------------------------------------
-# Main logic
+# Hook entry point
 # ---------------------------------------------------------------------------
+
+def save_raw(tool_use_id, stdout, stderr):
+    try:
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - RAW_KEEP_SECONDS
+        for old in RAW_DIR.glob("*.log"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+        safe_id = re.sub(r"[^\w-]", "", tool_use_id or str(time.time_ns()))
+        path = RAW_DIR / f"{safe_id}.log"
+        path.write_text(stdout + ("\n--- stderr ---\n" + stderr if stderr else ""))
+        return str(path)
+    except OSError:
+        return None
+
+
+def log_stats(data, label, before, after):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with STATS_FILE.open("a") as f:
+            f.write(json.dumps({
+                "ts": int(time.time()),
+                "project": data.get("cwd", ""),
+                "filter": label,
+                "command": data.get("tool_input", {}).get("command", "")[:200],
+                "before": before,
+                "after": after,
+            }) + "\n")
+    except OSError:
+        pass
+
+
+def compress(command, stdout, stderr, tool_use_id=None):
+    """Return (new_stdout, new_stderr, label), or None to leave output untouched."""
+    before = len(stdout) + len(stderr)
+    if before < MIN_CHARS:
+        return None
+
+    out, err = clean(stdout), clean(stderr)
+    label = "generic"
+    for pattern, fn, name in FILTERS:
+        if re.search(pattern, command):
+            out = "\n".join(fn(out.split("\n"))) if out else out
+            err = "\n".join(fn(err.split("\n"))) if err else err
+            label = name
+            break
+    if len(out) + len(err) > MAX_CHARS:
+        raw_path = save_raw(tool_use_id, stdout, stderr)
+        # Errors usually matter more than stdout noise: give stderr its share first.
+        err_share = min(len(err), MAX_CHARS // 3)
+        err = fit(err, max(err_share, 500), raw_path)
+        out = fit(out, max(MAX_CHARS - len(err), 500), raw_path)
+
+    after = len(out) + len(err)
+    if before - after < before * MIN_SAVING:
+        return None
+    return out, err, label
+
+
+def compact_tests(command):
+    """Return the command with --compact added, or None to leave it alone."""
+    command = command.strip()
+    if not COMPACT_TEST.match(command) or re.search(r"\s--(compact|help)\b|\s-h\b", command):
+        return None
+    return command + " --compact"
+
 
 def main():
-    try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        sys.exit(0)
+    if os.environ.get("TOKEN_COMPRESSOR", "").lower() in ("off", "0", "false"):
+        return
+    data = json.load(sys.stdin)
+    if data.get("tool_name") != "Bash":
+        return
+    tool_input = data.get("tool_input", {})
+    command = tool_input.get("command", "")
+    if OPT_OUT.search(command):
+        return
 
-    tool_name = data.get("tool_name", "")
+    if data.get("hook_event_name") == "PreToolUse":
+        rewritten = compact_tests(command)
+        if rewritten:
+            # No permissionDecision: Claude Code checks the rewritten command
+            # against your permission rules exactly as it would any other.
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "updatedInput": {**tool_input, "command": rewritten},
+                }
+            }))
+        return
 
-    # We only care about Bash tool calls
-    if tool_name != "Bash":
-        sys.exit(0)
+    response = data.get("tool_response")
+    if not isinstance(response, dict) or response.get("isImage"):
+        return
+    if response.get("persistedOutputPath"):
+        return  # too big for context anyway: Claude Code shows a 2KB preview
 
-    command = data.get("tool_input", {}).get("command", "")
+    stdout, stderr = response.get("stdout") or "", response.get("stderr") or ""
+    result = compress(command, stdout, stderr, data.get("tool_use_id"))
+    if result is None:
+        return
+    out, err, label = result
+    log_stats(data, label, len(stdout) + len(stderr), len(out) + len(err))
 
-    if not command:
-        sys.exit(0)
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": data.get("hook_event_name", "PostToolUse"),
+            "updatedToolOutput": {**response, "stdout": out, "stderr": err},
+        }
+    }))
 
-    # Don't double-truncate if someone already piped to head/tail/wc
-    if re.search(r'\|\s*(head|tail|wc)\b', command):
-        sys.exit(0)
 
-    # Don't truncate commands on the skip list
-    for skip in SKIP_PATTERNS:
-        if re.search(skip, command):
-            sys.exit(0)
-
-    # Check each rule
-    for pattern, max_lines, label in RULES:
-        if re.search(pattern, command):
-
-            # Run the command ourselves with truncation
-            try:
-                result = subprocess.run(
-                    f"( {command} ) 2>&1 | head -{max_lines}",
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                output = result.stdout.strip()
-            except subprocess.TimeoutExpired:
-                # Command timed out — let it pass through unmodified
-                sys.exit(0)
-            except Exception:
-                # Any other error — let it pass through unmodified
-                sys.exit(0)
-
-            # Count total lines to report how much was trimmed
-            try:
-                count_result = subprocess.run(
-                    f"( {command} ) 2>&1 | wc -l",
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                total_lines = count_result.stdout.strip()
-            except Exception:
-                total_lines = "unknown"
-
-            # Send truncated output to Claude via stderr and exit 2.
-            # Exit code 2 blocks the original command and feeds stderr
-            # directly to Claude as context — so Claude gets the trimmed
-            # result without ever seeing the full output.
-            print(
-                f"[compress_output hook] {label} trimmed to {max_lines} of {total_lines} lines.\n\n"
-                f"{output}",
-                file=sys.stderr
-            )
-            sys.exit(2)
-
-    # No rule matched — pass through unchanged
-    sys.exit(0)
+def stats():
+    if not STATS_FILE.exists():
+        print("No stats yet.")
+        return
+    rows = [json.loads(l) for l in STATS_FILE.read_text().splitlines() if l.strip()]
+    by = {}
+    for r in rows:
+        b = by.setdefault(r["filter"], [0, 0, 0])
+        b[0] += 1
+        b[1] += r["before"]
+        b[2] += r["after"]
+    total_before = sum(b[1] for b in by.values())
+    total_after = sum(b[2] for b in by.values())
+    print(f"{'filter':<10} {'runs':>6} {'chars before':>14} {'chars after':>13} {'saved':>7}")
+    for name, (n, before, after) in sorted(by.items(), key=lambda kv: kv[1][1] - kv[1][2], reverse=True):
+        print(f"{name:<10} {n:>6} {before:>14,} {after:>13,} {1 - after / before:>7.0%}")
+    if total_before:
+        print(f"{'total':<10} {len(rows):>6} {total_before:>14,} {total_after:>13,} {1 - total_after / total_before:>7.0%}")
+        print(f"\n≈ {(total_before - total_after) // 4:,} tokens kept out of context (at ~4 chars/token).")
 
 
 if __name__ == "__main__":
-    main()
+    if "--stats" in sys.argv:
+        stats()
+        sys.exit(0)
+    try:
+        main()
+    except Exception:
+        pass  # fail open: Claude gets the original output
+    sys.exit(0)
