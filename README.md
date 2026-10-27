@@ -12,6 +12,8 @@ cat storage/logs/...     22,705 chars  →  6,728 chars   (-70%, the ERROR line 
 
 *Figures are from the end-to-end test in this repo; your output will differ. Run `--stats` to see your own (see [Measuring savings](#measuring-savings)).*
 
+<a href="https://buymeacoffee.com/shaunn" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+
 ---
 
 ## Why this one is safe
@@ -186,3 +188,9 @@ This hook handles command output. For most projects, these matter as much or mor
 ## Licence
 
 MIT. Do whatever you like with it.
+
+## Support
+
+If the compressor saves you time, you can buy me a coffee:
+
+<a href="https://buymeacoffee.com/shaunn" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
